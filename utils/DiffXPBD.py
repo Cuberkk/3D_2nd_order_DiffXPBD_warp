@@ -102,21 +102,15 @@ def update_gamma_from_youngs_kernel(
 
 @wp.kernel
 def update_k_inv_from_youngs_kernel(
-    youngs: wp.array(dtype=wp.float32),
     fixed_mask: wp.array(dtype=wp.int32),
     k_inv: wp.array(dtype=wp.float32),
-    poisson_ratio: float,
     dt: float,
     avg_edge: float,
     selected_vid: int,
-    b_amp: wp.array(dtype=wp.float32),
     mass_vertex: wp.array(dtype=wp.float32)
 ):
     v = wp.tid()
-    E = youngs[0]
-    nu = poisson_ratio
-    damping = (4.0 * dt * E * b_amp[0]) / ((1.0 + nu) * avg_edge * avg_edge)
-    k = damping * dt + mass_vertex[v]
+    k = mass_vertex[v]
 
     if fixed_mask[v] == 1 or v == selected_vid:
         k_inv[v] = 1.0e-8
@@ -132,6 +126,9 @@ def update_compliance_from_youngs_kernel(
     poisson_ratio: float,
     dt: float,
     compliance_modulation: float,
+    r: wp.array(dtype=wp.mat22),
+    damping_effector: float,
+    damping_amp: wp.array(dtype=wp.float32),
 ):
     t = wp.tid()
     E = youngs[0]
@@ -142,7 +139,14 @@ def update_compliance_from_youngs_kernel(
 
     Hc = (1.0 / (lambda_lame * tet_volume[t] * dt * dt)) * compliance_modulation
     Dc = (1.0 / (mu_lame * tet_volume[t] * dt * dt)) * compliance_modulation
+
     compliance[t] = wp.mat22(Hc, 0.0, 0.0, Dc)
+
+    damping_hat = damping_effector * damping_amp[0] * dt * dt
+    Hcr = damping_hat * Hc / dt
+    Dcr = damping_hat * Dc / dt
+
+    r[t] = wp.mat22(Hcr, 0.0, 0.0, Dcr)
 
 @wp.kernel
 def update_external_force_kernel(
@@ -169,7 +173,7 @@ def update_external_part_from_k_inv_kernel(
     velocity: wp.array(dtype=wp.vec3),
 ):
     i = wp.tid()
-    external_part[i] = k_inv[i] * (mass_vertex[i] * dt * velocity[i] + external_force[i] * dt * dt)
+    external_part[i] = dt * velocity[i] + k_inv[i] * (external_force[i] * dt * dt)
 
 
 @wp.kernel
@@ -347,7 +351,7 @@ class DiffXPBDTapeFramework3D_Warp:
         target_unit: str = "mm",
         dt: float = 1.e-2,
         gravity_vec: tuple[float, float, float] = (0.0, -9.81, 0.0),
-        mass_total: float = 1.0,
+        mass_vertex: float = 1.0,
         poisson_ratio: float = 0.48,
         compliance_modulation: float = 1.e-2,
 
@@ -363,6 +367,7 @@ class DiffXPBDTapeFramework3D_Warp:
         series_force_mode: Optional[bool] = False,
         
         youngs_init: float = 10 * 1e6,
+        damping_effector_init: float = 1e4,
         force_amplification: float = 1.e0,
         damping_amplification: float = 0.1,
         mass_amplification: float = 1.0,
@@ -417,7 +422,7 @@ class DiffXPBDTapeFramework3D_Warp:
         self.dt = float(dt)
         self.gravity_vec = np.asarray(gravity_vec, dtype=np.float32) * self.acceleration_modulation
         self.mass_amplification = float(mass_amplification)
-        self.mass_total = float(mass_total) * self.mass_amplification
+        self.mass_per_vertex = float(mass_vertex) * self.mass_amplification
         self.poisson_ratio = float(poisson_ratio)
         self.compliance_modulation = float(compliance_modulation)
         self.sweep_count = int(sweep_count)
@@ -428,8 +433,8 @@ class DiffXPBDTapeFramework3D_Warp:
         self.mesh.load_gmsh(mesh_path, target_unit=target_unit)
         self.boundary_indices = self.mesh.get_oriented_boundary_faces_numpy().astype(np.int32)
         self.gripper_edge_indices = self.mesh.E_np.reshape(-1).astype(np.int32)
-
-        self.mass_per_vertex = self.mass_total / float(self.mesh.nv)
+        
+        self.mass_total = self.mass_per_vertex * self.mesh.nv
         self.mass_vertex_np = np.full(self.mesh.nv, self.mass_per_vertex, dtype=np.float32)
         self.mass_per_vertex_field = wp.array(self.mass_vertex_np, dtype=wp.float32, device=self.device, requires_grad=True)
 
@@ -495,7 +500,9 @@ class DiffXPBDTapeFramework3D_Warp:
         self.update_youngs_from_log(self.youngs_log, self.youngs)
         self.youngs_np = float(self.youngs.numpy()[0])
 
+        self.damping_effector_np = float(damping_effector_init)
         self.damping_amp_np = float(damping_amplification)
+        self.damping_hat_np = self.damping_effector_np * self.damping_amp_np * dt * dt
         self.damping_amp = wp.array([self.damping_amp_np], dtype=wp.float32, device=self.device, requires_grad=True)
 
         self.show_force_arrow = show_force_arrow
@@ -514,8 +521,9 @@ class DiffXPBDTapeFramework3D_Warp:
         self.gamma = wp.zeros(1, dtype=wp.float32, device=self.device, requires_grad=True)
         self.loss = wp.zeros(1, dtype=wp.float32, device=self.device, requires_grad=True)
 
-        self.k_inv = wp.zeros(self.mesh.nv, dtype=wp.float32, device=self.device, requires_grad=True)
+        self.m_inv = wp.zeros(self.mesh.nv, dtype=wp.float32, device=self.device, requires_grad=True)
         self.compliance = wp.zeros(self.mesh.nt, dtype=wp.mat22, device=self.device, requires_grad=True)
+        self.r = wp.zeros(self.mesh.nt, dtype=wp.mat22, device=self.device, requires_grad=True)
 
         self.gravity_vec_field = wp.zeros(self.mesh.nv, dtype=wp.vec3, device=self.device)
         self.external_force = wp.zeros(self.mesh.nv, dtype=wp.vec3, device=self.device, requires_grad=True)
@@ -681,23 +689,28 @@ class DiffXPBDTapeFramework3D_Warp:
         wp.launch(
             update_k_inv_from_youngs_kernel,
             dim=self.mesh.nv,
-            inputs=[self.youngs, 
-                    self.fixed_mask, 
+            inputs=[self.fixed_mask, 
                     k_inv, 
-                    self.poisson_ratio, 
                     self.dt, 
                     float(self.avg_edge), 
                     int(self.selected_vid), 
-                    damping_amp,
                     mass_vertex],
             device=self.device,
         )
 
-    def update_compliance_from_youngs(self, compliance):
+    def update_compliance_from_youngs(self, compliance, r):
         wp.launch(
             update_compliance_from_youngs_kernel,
             dim=self.mesh.nt,
-            inputs=[self.youngs, self.pc.tet_volume, compliance, self.poisson_ratio, self.dt, self.compliance_modulation],
+            inputs=[self.youngs, 
+                    self.pc.tet_volume, 
+                    compliance,
+                    self.poisson_ratio, 
+                    self.dt, 
+                    self.compliance_modulation,
+                    r,
+                    self.damping_effector_np,
+                    self.damping_amp,],
             device=self.device,
         )
 
@@ -786,14 +799,16 @@ class DiffXPBDTapeFramework3D_Warp:
     def solve_all_constraints_gui(self):
         self.solver.solve_all_constraints_local(
             topo=self.mesh.Topo,
-            x_old=self.x_state_curr,
+            x_predicted=self.x_state_curr,
+            x_previous=self.x_state_prev,
             Dm_inv_all=self.pc.Dm_inv,
-            k_inv=self.k_inv,
+            k_inv=self.m_inv,
             lambda_old=self.lambda_state,
             gamma_=self.gamma,
             compliance=self.compliance,
             delta_x_local=self.delta_x_local,
             delta_lambda_local=self.delta_lambda_local,
+            r=self.r,
         )
         wp.launch(
             update_lambda_from_local_kernel,
@@ -856,10 +871,10 @@ class DiffXPBDTapeFramework3D_Warp:
         self.applied_force_amp = wp.array([self.series_force_amp_np], dtype=wp.float32, device=self.device, requires_grad=False)
 
         self.update_gamma_from_youngs(self.gamma)
-        self.update_k_inv_from_youngs(self.k_inv, self.damping_amp, self.mass_per_vertex_field)
-        self.update_compliance_from_youngs(self.compliance)
+        self.update_k_inv_from_youngs(self.m_inv, self.damping_amp, self.mass_per_vertex_field)
+        self.update_compliance_from_youngs(self.compliance, self.r)
         self.update_external_force(self.external_force, self.applied_force_field, self.applied_force_amp)
-        self.update_external_part_from_youngs(self.external_force, self.k_inv, self.external_part, self.mass_per_vertex_field, self.x_velocity)
+        self.update_external_part_from_youngs(self.external_force, self.m_inv, self.external_part, self.mass_per_vertex_field, self.x_velocity)
         self.predictor_step_gui()
         self.reset_lambda_states()
 
@@ -906,7 +921,7 @@ class DiffXPBDTapeFramework3D_Warp:
     def solve_one_constraint_sweep_tape(self, stage: int, x_tape, b_inv, lambda_tape, gamma, compliance, delta_x_local_tape, delta_lambda_local_tape):
         self.solver.solve_all_constraints_local(
             topo=self.mesh.Topo,
-            x_old=x_tape[stage],
+            x_predicted=x_tape[stage],
             Dm_inv_all=self.pc.Dm_inv,
             k_inv=b_inv,
             lambda_old=lambda_tape[stage],
@@ -1059,7 +1074,7 @@ class DiffXPBDTapeFramework3D_Warp:
             fps = int(1.0 / (self.dt))
 
         self.opengl_renderer = warp.render.OpenGLRenderer(
-            title = "Hybrid XPBD",
+            title = "2nd-order XPBD (damping enabled)",
             fps=fps,
             screen_width=screen_width,
             screen_height=screen_height,
@@ -1416,8 +1431,11 @@ class DiffXPBDTapeFramework3D_Warp:
             return 'Negative'
 
     def _draw_my_overlay(self,):
-        self.my_label.text = f"Youngs: {self.youngs_np:.2f}"
-        self.my_label.text += f"\nYoungs Log: {self.youngs_log_np:.2f}"
+        self.my_label.text = f"Simulation setup:"
+        self.my_label.text += f"\nYoungs: {self.youngs_np:.2f}, Youngs Log: {self.youngs_log_np:.2f}"
+        self.my_label.text += f"\nMass per Vertex: {self.mass_per_vertex:.2f}, Total Mass: {self.mass_total:.2f}"
+        self.my_label.text += f"\nDamping * dt: {self.damping_hat_np:.2f}, Damping: {self.damping_effector_np:.2f}"
+        self.my_label.text = f"\n\nReal-time parameters:"
         self.my_label.text += f"\nStep: {self.step+1}/{self.total_steps}\nTimes: {(self.step+1)*self.dt:.2f}/{self.total_time}s"
         self.my_label.text += f"\nApplied Force: ({self.applied_force_np[0]:.2e}, {self.applied_force_np[1]:.2e}, {self.applied_force_np[2]:.2e})"
         self.my_label.text += f"\nF_free_elastic: ({self.total_free_node_force[0]:.2e}, {self.total_free_node_force[1]:.2e}, {self.total_free_node_force[2]:.2e})"

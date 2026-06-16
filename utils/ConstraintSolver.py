@@ -111,15 +111,17 @@ def gradient_neo_hookean_D(F: mat33, Dm_inv: mat33):
 @wp.kernel
 def solve_constraints_local_kernel(
     topo: wp.array(dtype=vec4i),              # (nt,)
-    x_old: wp.array(dtype=vec3f),             # (nv,)
+    x_predicted: wp.array(dtype=vec3f),       # (nv,)
+    x_previous: wp.array(dtype=vec3f),        # (nv,)
     Dm_inv_all: wp.array(dtype=mat33),        # (nt,)
-    k_inv: wp.array(dtype=wp.float32),        # (nv,)
+    m_inv: wp.array(dtype=wp.float32),        # (nv,)
     lambda_old: wp.array(dtype=vec2f),        # (nt,)
     gamma_: wp.array(dtype=wp.float32),       # shape (1,)
     compliance: wp.array(dtype=mat22),        # (nt,)
     delta_x_local: wp.array(dtype=vec12),     # (nt,)
     delta_lambda_local: wp.array(dtype=vec2f),# (nt,)
     eps: float,
+    r: wp.array(dtype=mat22), # (nt,)
 ):
     i = wp.tid()
 
@@ -129,10 +131,22 @@ def solve_constraints_local_kernel(
     id2 = tet[2]
     id3 = tet[3]
 
-    v1 = x_old[id0]
-    v2 = x_old[id1]
-    v3 = x_old[id2]
-    v4 = x_old[id3]
+    v1 = x_predicted[id0]
+    v2 = x_predicted[id1]
+    v3 = x_predicted[id2]
+    v4 = x_predicted[id3]
+
+    v1_prev = x_previous[id0]
+    v2_prev = x_previous[id1]
+    v3_prev = x_previous[id2]
+    v4_prev = x_previous[id3]
+
+    dv = vec12(
+        v1[0] - v1_prev[0], v1[1] - v1_prev[1], v1[2] - v1_prev[2],
+        v2[0] - v2_prev[0], v2[1] - v2_prev[1], v2[2] - v2_prev[2],
+        v3[0] - v3_prev[0], v3[1] - v3_prev[1], v3[2] - v3_prev[2],
+        v4[0] - v4_prev[0], v4[1] - v4_prev[1], v4[2] - v4_prev[2],
+    )
 
     Ds = wp.matrix_from_cols(v1 - v4, v2 - v4, v3 - v4)
     Dm_inv = Dm_inv_all[i]
@@ -145,36 +159,44 @@ def solve_constraints_local_kernel(
     H_compliance = compliance[i][0, 0]
     D_compliance = compliance[i][1, 1]
 
+    H_damping = r[i][0, 0]
+    D_damping = r[i][1, 1]
+
     constraint_H = J - gamma_[0]
     constraint_D = wp.sqrt(wp.trace(wp.transpose(F) * F)) - wp.sqrt(3.0)
 
     dCH = gradient_neo_hookean_H(F, J, Dm_inv)
     dCD = gradient_neo_hookean_D(F, Dm_inv)
 
-    b0 = k_inv[id0]
-    b1 = k_inv[id1]
-    b2 = k_inv[id2]
-    b3 = k_inv[id3]
+    m0 = m_inv[id0]
+    m1 = m_inv[id1]
+    m2 = m_inv[id2]
+    m3 = m_inv[id3]
 
-    A00 = local_quad_form(dCH, dCH, b0, b1, b2, b3) + H_compliance
-    A01 = local_quad_form(dCH, dCD, b0, b1, b2, b3)
-    A11 = local_quad_form(dCD, dCD, b0, b1, b2, b3) + D_compliance
+    A00 = (1. + H_damping) * local_quad_form(dCH, dCH, m0, m1, m2, m3) + H_compliance
+    A01 = (1. + H_damping) * local_quad_form(dCH, dCD, m0, m1, m2, m3)
+    A10 = (1. + D_damping) * local_quad_form(dCH, dCD, m0, m1, m2, m3)
+    A11 = (1. + D_damping) * local_quad_form(dCD, dCD, m0, m1, m2, m3) + D_compliance
 
     lam = lambda_old[i]
 
-    rhs0 = -(constraint_H + H_compliance * lam[0])
-    rhs1 = -(constraint_D + D_compliance * lam[1])
+    rhs0 = -(constraint_H + H_compliance * lam[0] + H_damping * wp.dot(dCH, dv))
+    rhs1 = -(constraint_D + D_compliance * lam[1] + D_damping * wp.dot(dCD, dv))
 
-    detA = A00 * A11 - A01 * A01
+    detA = A00 * A11 - A01 * A10
+
+    if wp.abs(detA) < eps:
+        detA = eps
+
     inv_det = 1.0 / detA
 
     delta_lambda = vec2f(
         ( A11 * rhs0 - A01 * rhs1) * inv_det,
-        (-A01 * rhs0 + A00 * rhs1) * inv_det,
+        (-A10 * rhs0 + A00 * rhs1) * inv_det,
     )
 
     grad_combined = delta_lambda[0] * dCH + delta_lambda[1] * dCD
-    dx = local_B_inv_dot(grad_combined, b0, b1, b2, b3)
+    dx = local_B_inv_dot(grad_combined, m0, m1, m2, m3)
 
     delta_x_local[i] = dx
     delta_lambda_local[i] = delta_lambda
@@ -256,7 +278,8 @@ class EnergyConstraintSolver3D_Warp:
     def solve_all_constraints_local(
         self,
         topo,
-        x_old,
+        x_predicted,
+        x_previous,
         Dm_inv_all,
         k_inv,
         lambda_old,
@@ -264,13 +287,15 @@ class EnergyConstraintSolver3D_Warp:
         compliance,
         delta_x_local,
         delta_lambda_local,
+        r,
     ):
         wp.launch(
             kernel=solve_constraints_local_kernel,
             dim=topo.shape[0],
             inputs=[
                 topo,
-                x_old,
+                x_predicted,
+                x_previous,
                 Dm_inv_all,
                 k_inv,
                 lambda_old,
@@ -279,6 +304,7 @@ class EnergyConstraintSolver3D_Warp:
                 delta_x_local,
                 delta_lambda_local,
                 self.eps,
+                r,
             ],
             device=self.device,
         )
